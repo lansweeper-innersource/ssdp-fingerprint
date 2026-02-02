@@ -20,7 +20,8 @@ struct SsdpLogEntry {
     timestamp_local: String,
     source_ip: String,
     source_port: u16,
-    method: String,
+    packet_type: String,
+    status_line: String,
     headers: HashMap<String, String>,
     fingerprint: Option<DeviceFingerprint>,
     is_new_device: bool,
@@ -33,7 +34,8 @@ struct DeviceFingerprint {
 }
 
 struct SsdpPacket {
-    method: String,
+    packet_type: String,
+    status_line: String,
     headers: HashMap<String, String>,
 }
 
@@ -41,13 +43,20 @@ fn parse_ssdp_packet(data: &[u8]) -> Option<SsdpPacket> {
     let text = std::str::from_utf8(data).ok()?;
     let mut lines = text.lines();
 
-    let first_line = lines.next()?;
-    let method = if first_line.starts_with("NOTIFY") {
-        "NOTIFY".to_string()
+    let first_line = lines.next()?.trim();
+    let (packet_type, status_line) = if first_line.starts_with("NOTIFY") {
+        ("NOTIFY".to_string(), first_line.to_string())
     } else if first_line.starts_with("M-SEARCH") {
-        "M-SEARCH".to_string()
+        ("M-SEARCH".to_string(), first_line.to_string())
     } else if first_line.starts_with("HTTP/") {
-        "RESPONSE".to_string()
+        // Parse HTTP response: "HTTP/1.1 200 OK"
+        let status_line = first_line.to_string();
+        let packet_type = if first_line.contains("200") {
+            "HTTP 200 OK".to_string()
+        } else {
+            format!("HTTP RESPONSE ({})", first_line)
+        };
+        (packet_type, status_line)
     } else {
         return None;
     };
@@ -65,20 +74,24 @@ fn parse_ssdp_packet(data: &[u8]) -> Option<SsdpPacket> {
         }
     }
 
-    Some(SsdpPacket { method, headers })
+    Some(SsdpPacket { packet_type, status_line, headers })
 }
 
 fn fingerprint_device(headers: &HashMap<String, String>) -> DeviceFingerprint {
     let server = headers.get("SERVER").cloned();
-    let nt = headers.get("NT").cloned();
     let usn = headers.get("USN").cloned();
 
-    let server_lower = server.as_ref().map(|s| s.to_lowercase()).unwrap_or_default();
-    let nt_lower = nt.as_ref().map(|s| s.to_lowercase()).unwrap_or_default();
+    // Use NT for NOTIFY packets, ST for M-SEARCH responses
+    let service_type = headers.get("NT")
+        .or_else(|| headers.get("ST"))
+        .cloned();
 
-    let device_type = if server_lower.contains("castdevice") || nt_lower.contains("dial-multiscreen") {
+    let server_lower = server.as_ref().map(|s| s.to_lowercase()).unwrap_or_default();
+    let st_lower = service_type.as_ref().map(|s| s.to_lowercase()).unwrap_or_default();
+
+    let device_type = if server_lower.contains("castdevice") || st_lower.contains("dial-multiscreen") {
         "Chromecast"
-    } else if server_lower.contains("roku") || nt_lower.contains("roku") {
+    } else if server_lower.contains("roku") || st_lower.contains("roku") {
         "Roku"
     } else if server_lower.contains("sec_hhp_") || server_lower.contains("samsung") {
         "Samsung TV"
@@ -102,11 +115,11 @@ fn fingerprint_device(headers: &HashMap<String, String>) -> DeviceFingerprint {
         "Synology NAS"
     } else if server_lower.contains("qnap") {
         "QNAP NAS"
-    } else if nt_lower.contains("mediarenderer") {
+    } else if st_lower.contains("mediarenderer") {
         "Media Renderer"
-    } else if nt_lower.contains("mediaserver") {
+    } else if st_lower.contains("mediaserver") {
         "Media Server"
-    } else if nt_lower.contains("upnp:rootdevice") {
+    } else if st_lower.contains("upnp:rootdevice") {
         "UPnP Device"
     } else {
         "Unknown"
@@ -154,35 +167,6 @@ fn create_multicast_socket() -> io::Result<Socket> {
     Ok(socket)
 }
 
-fn send_msearch() -> io::Result<()> {
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    let dest = SocketAddrV4::new(SSDP_ADDR, SSDP_PORT);
-
-    let msearch = "M-SEARCH * HTTP/1.1\r\n\
-                   HOST: 239.255.255.250:1900\r\n\
-                   MAN: \"ssdp:discover\"\r\n\
-                   MX: 3\r\n\
-                   ST: ssdp:all\r\n\
-                   \r\n";
-
-    socket.send_to(msearch.as_bytes(), dest)?;
-    Ok(())
-}
-
-fn start_msearch_sender() {
-    thread::spawn(|| {
-        loop {
-            thread::sleep(Duration::from_secs(MSEARCH_INTERVAL_SECS));
-            if let Err(e) = send_msearch() {
-                eprintln!("Failed to send M-SEARCH: {}", e);
-            } else {
-                let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
-                println!("[{}] Sent M-SEARCH discovery request", timestamp);
-            }
-        }
-    });
-}
-
 fn open_log_file() -> io::Result<BufWriter<File>> {
     let file = OpenOptions::new()
         .create(true)
@@ -203,7 +187,8 @@ fn write_log_entry(writer: &Arc<Mutex<BufWriter<File>>>, entry: &SsdpLogEntry) {
 fn print_packet(entry: &SsdpLogEntry) {
     let marker = if entry.is_new_device { "NEW DEVICE" } else { "PACKET" };
     println!("[{}] {} from {}:{}", entry.timestamp_local, marker, entry.source_ip, entry.source_port);
-    println!("  Method: {}", entry.method);
+    println!("  Type: {}", entry.packet_type);
+    println!("  Status: {}", entry.status_line);
 
     if let Some(fp) = &entry.fingerprint {
         println!("  Fingerprint: {}", fp.device_type);
@@ -221,69 +206,147 @@ fn print_packet(entry: &SsdpLogEntry) {
     println!();
 }
 
+fn process_packet(
+    data: &[u8],
+    source_ip: String,
+    source_port: u16,
+    seen_usns: &Arc<Mutex<HashSet<String>>>,
+    log_writer: &Arc<Mutex<BufWriter<File>>>,
+) {
+    let Some(packet) = parse_ssdp_packet(data) else {
+        return;
+    };
+
+    // Skip M-SEARCH requests (we only care about responses/notifications)
+    if packet.packet_type == "M-SEARCH" {
+        return;
+    }
+
+    let usn = packet.headers.get("USN").cloned().unwrap_or_default();
+
+    let is_new_device = if !usn.is_empty() {
+        let mut seen = seen_usns.lock().unwrap();
+        if seen.contains(&usn) {
+            false
+        } else {
+            seen.insert(usn.clone());
+            true
+        }
+    } else {
+        false
+    };
+
+    let fingerprint = fingerprint_device(&packet.headers);
+    let now = Utc::now();
+
+    let entry = SsdpLogEntry {
+        timestamp: now,
+        timestamp_local: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        source_ip,
+        source_port,
+        packet_type: packet.packet_type,
+        status_line: packet.status_line,
+        headers: packet.headers,
+        fingerprint: Some(fingerprint),
+        is_new_device,
+    };
+
+    write_log_entry(log_writer, &entry);
+    print_packet(&entry);
+}
+
+fn start_msearch_listener(
+    seen_usns: Arc<Mutex<HashSet<String>>>,
+    log_writer: Arc<Mutex<BufWriter<File>>>,
+) {
+    thread::spawn(move || {
+        // Create a socket for M-SEARCH - bind to ephemeral port to receive unicast responses
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to create M-SEARCH socket: {}", e);
+                return;
+            }
+        };
+
+        let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        println!("M-SEARCH listener on port {} (for unicast responses)", local_port);
+
+        let dest = SocketAddrV4::new(SSDP_ADDR, SSDP_PORT);
+        let msearch = "M-SEARCH * HTTP/1.1\r\n\
+                       HOST: 239.255.255.250:1900\r\n\
+                       MAN: \"ssdp:discover\"\r\n\
+                       MX: 3\r\n\
+                       ST: ssdp:all\r\n\
+                       \r\n";
+
+        // Set read timeout so we can periodically send M-SEARCH
+        let _ = socket.set_read_timeout(Some(Duration::from_secs(MSEARCH_INTERVAL_SECS)));
+
+        let mut buf = [0u8; 4096];
+
+        loop {
+            // Send M-SEARCH
+            if let Err(e) = socket.send_to(msearch.as_bytes(), dest) {
+                eprintln!("Failed to send M-SEARCH: {}", e);
+            } else {
+                let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+                println!("[{}] Sent M-SEARCH discovery request", timestamp);
+            }
+
+            // Listen for responses until timeout
+            let deadline = std::time::Instant::now() + Duration::from_secs(MSEARCH_INTERVAL_SECS);
+            while std::time::Instant::now() < deadline {
+                match socket.recv_from(&mut buf) {
+                    Ok((len, addr)) => {
+                        let source_ip = addr.ip().to_string();
+                        let source_port = addr.port();
+                        process_packet(&buf[..len], source_ip, source_port, &seen_usns, &log_writer);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Timeout, continue to send next M-SEARCH
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        // Timeout on Windows
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("Error receiving M-SEARCH response: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn main() -> io::Result<()> {
     println!("SSDP Device Fingerprinter");
     println!("=========================");
-    println!("Listening for SSDP announcements...");
-    println!("Sending M-SEARCH every {} seconds", MSEARCH_INTERVAL_SECS);
+    println!("Listening for SSDP announcements (multicast NOTIFY)");
+    println!("Sending M-SEARCH every {} seconds (unicast responses)", MSEARCH_INTERVAL_SECS);
     println!("Logging packets to: {}\n", LOG_FILE);
 
     let log_writer = Arc::new(Mutex::new(open_log_file()?));
+    let seen_usns: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
     let socket = create_multicast_socket()?;
 
-    // Send initial M-SEARCH immediately, then start periodic sender
-    if let Err(e) = send_msearch() {
-        eprintln!("Failed to send initial M-SEARCH: {}", e);
-    } else {
-        println!("[{}] Sent initial M-SEARCH discovery request\n", Local::now().format("%Y-%m-%d %H:%M:%S"));
-    }
-    start_msearch_sender();
+    // Start M-SEARCH sender/receiver thread for unicast responses
+    start_msearch_listener(Arc::clone(&seen_usns), Arc::clone(&log_writer));
 
     let mut buf = [0u8; 4096];
-    let mut seen_usns: HashSet<String> = HashSet::new();
 
+    // Main loop: listen for multicast NOTIFY packets
     loop {
         let (len, addr) = socket.recv_from(unsafe {
             std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>, buf.len())
         })?;
 
-        let data = &buf[..len];
+        let source_ip = addr.as_socket_ipv4().map(|a| a.ip().to_string()).unwrap_or_default();
+        let source_port = addr.as_socket_ipv4().map(|a| a.port()).unwrap_or(0);
 
-        if let Some(packet) = parse_ssdp_packet(data) {
-            // Skip M-SEARCH requests (we only care about responses/notifications)
-            if packet.method == "M-SEARCH" {
-                continue;
-            }
-
-            let source_ip = addr.as_socket_ipv4().map(|a| a.ip().to_string()).unwrap_or_default();
-            let source_port = addr.as_socket_ipv4().map(|a| a.port()).unwrap_or(0);
-
-            let usn = packet.headers.get("USN").cloned().unwrap_or_default();
-            let is_new_device = !usn.is_empty() && !seen_usns.contains(&usn);
-
-            if is_new_device {
-                seen_usns.insert(usn.clone());
-            }
-
-            let fingerprint = fingerprint_device(&packet.headers);
-            let now = Utc::now();
-
-            let entry = SsdpLogEntry {
-                timestamp: now,
-                timestamp_local: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-                source_ip,
-                source_port,
-                method: packet.method,
-                headers: packet.headers,
-                fingerprint: Some(fingerprint),
-                is_new_device,
-            };
-
-            // Write to log file (all packets)
-            write_log_entry(&log_writer, &entry);
-
-            // Print to console (all packets, but highlight new devices)
-            print_packet(&entry);
-        }
+        process_packet(&buf[..len], source_ip, source_port, &seen_usns, &log_writer);
     }
 }
