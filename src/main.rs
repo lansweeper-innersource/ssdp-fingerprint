@@ -113,6 +113,8 @@ fn fingerprint_device(headers: &HashMap<String, String>) -> DeviceFingerprint {
         "Synology NAS"
     } else if server_lower.contains("qnap") {
         "QNAP NAS"
+    } else if server_lower.contains("fingbox") {
+        "Fing Fingbox"
     } else if st_lower.contains("mediarenderer") {
         "Media Renderer"
     } else if st_lower.contains("mediaserver") {
