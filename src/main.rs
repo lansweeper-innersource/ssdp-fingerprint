@@ -1,4 +1,6 @@
 use chrono::{DateTime, Local, Utc};
+use clap::Parser;
+use if_addrs::get_if_addrs;
 use serde::Serialize;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::{HashMap, HashSet};
@@ -13,6 +15,83 @@ const SSDP_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
 const MSEARCH_INTERVAL_SECS: u64 = 30;
 const LOG_FILE: &str = "ssdp-packets.jsonl";
+
+#[derive(Parser, Debug)]
+#[command(name = "ssdp-fingerprint")]
+#[command(about = "SSDP Device Fingerprinter - Listen for SSDP announcements and fingerprint devices")]
+struct Args {
+    /// List available network interfaces and exit
+    #[arg(short = 'l', long)]
+    list_interfaces: bool,
+
+    /// Network interface to use (e.g., en0, eth0)
+    #[arg(short, long)]
+    interface: Option<String>,
+
+    /// Local IP address to bind to (alternative to --interface)
+    #[arg(short = 'b', long)]
+    bind_ip: Option<Ipv4Addr>,
+}
+
+fn list_interfaces() {
+    println!("Available network interfaces:");
+    println!("{:-<60}", "");
+    println!("{:<20} {:<20} {:<10}", "INTERFACE", "IPv4 ADDRESS", "TYPE");
+    println!("{:-<60}", "");
+
+    match get_if_addrs() {
+        Ok(interfaces) => {
+            for iface in interfaces {
+                if let if_addrs::IfAddr::V4(v4) = &iface.addr {
+                    let iface_type = if iface.is_loopback() {
+                        "loopback"
+                    } else if iface.name.starts_with("utun") || iface.name.starts_with("tun") {
+                        "VPN/tunnel"
+                    } else if iface.name.starts_with("en") || iface.name.starts_with("eth") {
+                        "ethernet"
+                    } else if iface.name.starts_with("wlan") || iface.name.starts_with("wl") {
+                        "wireless"
+                    } else if iface.name.starts_with("bridge") || iface.name.starts_with("br") {
+                        "bridge"
+                    } else {
+                        "other"
+                    };
+                    println!("{:<20} {:<20} {:<10}", iface.name, v4.ip, iface_type);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to list interfaces: {}", e);
+        }
+    }
+    println!("{:-<60}", "");
+    println!("\nUsage: ssdp-fingerprint --interface <NAME> or --bind-ip <IP>");
+}
+
+fn resolve_interface_ip(args: &Args) -> Option<Ipv4Addr> {
+    // If bind_ip is specified, use it directly
+    if let Some(ip) = args.bind_ip {
+        return Some(ip);
+    }
+
+    // If interface name is specified, look up its IP
+    if let Some(ref iface_name) = args.interface {
+        if let Ok(interfaces) = get_if_addrs() {
+            for iface in interfaces {
+                if iface.name == *iface_name {
+                    if let if_addrs::IfAddr::V4(v4) = &iface.addr {
+                        return Some(v4.ip);
+                    }
+                }
+            }
+        }
+        eprintln!("Warning: Interface '{}' not found or has no IPv4 address", iface_name);
+        return None;
+    }
+
+    // Fall back to auto-detection
+    None
+}
 
 #[derive(Debug, Serialize)]
 struct SsdpLogEntry {
@@ -149,8 +228,8 @@ fn extract_device_name(usn: &Option<String>, server: &Option<String>) -> Option<
     })
 }
 
-fn get_local_ip() -> Option<Ipv4Addr> {
-    // Try to find a non-loopback IPv4 address
+fn get_local_ip_auto() -> Option<Ipv4Addr> {
+    // Try to find a non-loopback IPv4 address by checking default route
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     match socket.local_addr().ok()? {
@@ -159,7 +238,7 @@ fn get_local_ip() -> Option<Ipv4Addr> {
     }
 }
 
-fn create_multicast_socket() -> io::Result<UdpSocket> {
+fn create_multicast_socket(local_ip: Ipv4Addr) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
     socket.set_reuse_address(true)?;
@@ -171,8 +250,6 @@ fn create_multicast_socket() -> io::Result<UdpSocket> {
     let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, SSDP_PORT);
     socket.bind(&addr.into())?;
 
-    // Get local IP for multicast interface binding
-    let local_ip = get_local_ip().unwrap_or(Ipv4Addr::UNSPECIFIED);
     println!("Local IP for multicast: {}", local_ip);
 
     // Join multicast group on the specific interface
@@ -280,18 +357,21 @@ fn process_packet(
 fn start_msearch_listener(
     seen_usns: Arc<Mutex<HashSet<String>>>,
     log_writer: Arc<Mutex<BufWriter<File>>>,
+    local_ip: Ipv4Addr,
 ) {
     thread::spawn(move || {
-        let socket = match UdpSocket::bind("0.0.0.0:0") {
+        // Bind to the specific interface IP to ensure M-SEARCH goes out on the right interface
+        let bind_addr = SocketAddrV4::new(local_ip, 0);
+        let socket = match UdpSocket::bind(bind_addr) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Failed to create M-SEARCH socket: {}", e);
+                eprintln!("Failed to create M-SEARCH socket on {}: {}", local_ip, e);
                 return;
             }
         };
 
         let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
-        println!("M-SEARCH listener on port {} (for unicast responses)", local_port);
+        println!("M-SEARCH listener on {}:{} (for unicast responses)", local_ip, local_port);
 
         let dest = SocketAddrV4::new(SSDP_ADDR, SSDP_PORT);
         let msearch = "M-SEARCH * HTTP/1.1\r\n\
@@ -338,8 +418,26 @@ fn start_msearch_listener(
 }
 
 fn main() -> io::Result<()> {
+    let args = Args::parse();
+
+    // Handle --list-interfaces
+    if args.list_interfaces {
+        list_interfaces();
+        return Ok(());
+    }
+
+    // Resolve the local IP to use
+    let local_ip = resolve_interface_ip(&args)
+        .or_else(get_local_ip_auto)
+        .unwrap_or(Ipv4Addr::UNSPECIFIED);
+
     println!("SSDP Device Fingerprinter");
     println!("=========================");
+    if args.interface.is_some() || args.bind_ip.is_some() {
+        println!("Using interface IP: {}", local_ip);
+    } else {
+        println!("Auto-detected interface IP: {}", local_ip);
+    }
     println!("Listening for SSDP announcements (multicast NOTIFY)");
     println!("Sending M-SEARCH every {} seconds (unicast responses)", MSEARCH_INTERVAL_SECS);
     println!("Logging packets to: {}\n", LOG_FILE);
@@ -347,10 +445,10 @@ fn main() -> io::Result<()> {
     let log_writer = Arc::new(Mutex::new(open_log_file()?));
     let seen_usns: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
-    let socket = create_multicast_socket()?;
+    let socket = create_multicast_socket(local_ip)?;
 
     // Start M-SEARCH sender/receiver thread for unicast responses
-    start_msearch_listener(Arc::clone(&seen_usns), Arc::clone(&log_writer));
+    start_msearch_listener(Arc::clone(&seen_usns), Arc::clone(&log_writer), local_ip);
 
     let mut buf = [0u8; 4096];
 
