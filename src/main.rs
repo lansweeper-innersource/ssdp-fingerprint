@@ -49,7 +49,6 @@ fn parse_ssdp_packet(data: &[u8]) -> Option<SsdpPacket> {
     } else if first_line.starts_with("M-SEARCH") {
         ("M-SEARCH".to_string(), first_line.to_string())
     } else if first_line.starts_with("HTTP/") {
-        // Parse HTTP response: "HTTP/1.1 200 OK"
         let status_line = first_line.to_string();
         let packet_type = if first_line.contains("200") {
             "HTTP 200 OK".to_string()
@@ -81,7 +80,6 @@ fn fingerprint_device(headers: &HashMap<String, String>) -> DeviceFingerprint {
     let server = headers.get("SERVER").cloned();
     let usn = headers.get("USN").cloned();
 
-    // Use NT for NOTIFY packets, ST for M-SEARCH responses
     let service_type = headers.get("NT")
         .or_else(|| headers.get("ST"))
         .cloned();
@@ -149,7 +147,17 @@ fn extract_device_name(usn: &Option<String>, server: &Option<String>) -> Option<
     })
 }
 
-fn create_multicast_socket() -> io::Result<Socket> {
+fn get_local_ip() -> Option<Ipv4Addr> {
+    // Try to find a non-loopback IPv4 address
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()? {
+        std::net::SocketAddr::V4(addr) => Some(*addr.ip()),
+        _ => None,
+    }
+}
+
+fn create_multicast_socket() -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
     socket.set_reuse_address(true)?;
@@ -157,14 +165,26 @@ fn create_multicast_socket() -> io::Result<Socket> {
     #[cfg(unix)]
     socket.set_reuse_port(true)?;
 
+    // Bind to INADDR_ANY on the SSDP port
     let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, SSDP_PORT);
     socket.bind(&addr.into())?;
 
-    socket.join_multicast_v4(&SSDP_ADDR, &Ipv4Addr::UNSPECIFIED)?;
+    // Get local IP for multicast interface binding
+    let local_ip = get_local_ip().unwrap_or(Ipv4Addr::UNSPECIFIED);
+    println!("Local IP for multicast: {}", local_ip);
+
+    // Join multicast group on the specific interface
+    socket.join_multicast_v4(&SSDP_ADDR, &local_ip)?;
+
+    // Enable multicast loopback to see our own packets (useful for debugging)
+    socket.set_multicast_loop_v4(true)?;
 
     println!("Joined multicast group {} on port {}", SSDP_ADDR, SSDP_PORT);
 
-    Ok(socket)
+    // Convert socket2::Socket to std::net::UdpSocket
+    let std_socket: UdpSocket = socket.into();
+
+    Ok(std_socket)
 }
 
 fn open_log_file() -> io::Result<BufWriter<File>> {
@@ -260,7 +280,6 @@ fn start_msearch_listener(
     log_writer: Arc<Mutex<BufWriter<File>>>,
 ) {
     thread::spawn(move || {
-        // Create a socket for M-SEARCH - bind to ephemeral port to receive unicast responses
         let socket = match UdpSocket::bind("0.0.0.0:0") {
             Ok(s) => s,
             Err(e) => {
@@ -280,13 +299,11 @@ fn start_msearch_listener(
                        ST: ssdp:all\r\n\
                        \r\n";
 
-        // Set read timeout so we can periodically send M-SEARCH
         let _ = socket.set_read_timeout(Some(Duration::from_secs(MSEARCH_INTERVAL_SECS)));
 
         let mut buf = [0u8; 4096];
 
         loop {
-            // Send M-SEARCH
             if let Err(e) = socket.send_to(msearch.as_bytes(), dest) {
                 eprintln!("Failed to send M-SEARCH: {}", e);
             } else {
@@ -294,7 +311,6 @@ fn start_msearch_listener(
                 println!("[{}] Sent M-SEARCH discovery request", timestamp);
             }
 
-            // Listen for responses until timeout
             let deadline = std::time::Instant::now() + Duration::from_secs(MSEARCH_INTERVAL_SECS);
             while std::time::Instant::now() < deadline {
                 match socket.recv_from(&mut buf) {
@@ -304,11 +320,9 @@ fn start_msearch_listener(
                         process_packet(&buf[..len], source_ip, source_port, &seen_usns, &log_writer);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // Timeout, continue to send next M-SEARCH
                         break;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                        // Timeout on Windows
                         break;
                     }
                     Err(e) => {
@@ -338,15 +352,19 @@ fn main() -> io::Result<()> {
 
     let mut buf = [0u8; 4096];
 
+    println!("Waiting for packets...\n");
+
     // Main loop: listen for multicast NOTIFY packets
     loop {
-        let (len, addr) = socket.recv_from(unsafe {
-            std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>, buf.len())
-        })?;
-
-        let source_ip = addr.as_socket_ipv4().map(|a| a.ip().to_string()).unwrap_or_default();
-        let source_port = addr.as_socket_ipv4().map(|a| a.port()).unwrap_or(0);
-
-        process_packet(&buf[..len], source_ip, source_port, &seen_usns, &log_writer);
+        match socket.recv_from(&mut buf) {
+            Ok((len, addr)) => {
+                let source_ip = addr.ip().to_string();
+                let source_port = addr.port();
+                process_packet(&buf[..len], source_ip, source_port, &seen_usns, &log_writer);
+            }
+            Err(e) => {
+                eprintln!("Error receiving packet: {}", e);
+            }
+        }
     }
 }
