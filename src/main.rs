@@ -93,6 +93,15 @@ fn resolve_interface_ip(args: &Args) -> Option<Ipv4Addr> {
     None
 }
 
+/// Decode M-SEARCH specific fields into human-readable format
+#[derive(Debug, Serialize)]
+struct MSearchDetails {
+    search_target: String,
+    search_target_description: String,
+    max_wait_seconds: Option<u32>,
+    discovery_type: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SsdpLogEntry {
     timestamp: DateTime<Utc>,
@@ -104,6 +113,8 @@ struct SsdpLogEntry {
     headers: HashMap<String, String>,
     fingerprint: Option<DeviceFingerprint>,
     is_new_device: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msearch_details: Option<MSearchDetails>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -228,6 +239,129 @@ fn extract_device_name(usn: &Option<String>, server: &Option<String>) -> Option<
     })
 }
 
+fn fingerprint_msearch_sender(headers: &HashMap<String, String>) -> DeviceFingerprint {
+    let user_agent = headers.get("USER-AGENT").cloned();
+    let st = headers.get("ST").cloned();
+
+    let ua_lower = user_agent.as_ref().map(|s| s.to_lowercase()).unwrap_or_default();
+    let st_lower = st.as_ref().map(|s| s.to_lowercase()).unwrap_or_default();
+
+    let device_type = if ua_lower.contains("chromecast") || ua_lower.contains("castdevice") {
+        "Chromecast"
+    } else if ua_lower.contains("roku") {
+        "Roku"
+    } else if ua_lower.contains("samsung") || ua_lower.contains("tizen") {
+        "Samsung TV"
+    } else if ua_lower.contains("lg") || ua_lower.contains("webos") {
+        "LG TV"
+    } else if ua_lower.contains("sonos") {
+        "Sonos"
+    } else if ua_lower.contains("hue") || ua_lower.contains("philips") {
+        "Philips Hue"
+    } else if ua_lower.contains("darwin") || ua_lower.contains("apple") || ua_lower.contains("ios") {
+        "Apple Device"
+    } else if ua_lower.contains("microsoft") || ua_lower.contains("windows") {
+        "Windows"
+    } else if ua_lower.contains("android") {
+        "Android Device"
+    } else if ua_lower.contains("linux") {
+        "Linux Device"
+    } else if ua_lower.contains("plex") {
+        "Plex Client"
+    } else if ua_lower.contains("kodi") || ua_lower.contains("xbmc") {
+        "Kodi"
+    } else if ua_lower.contains("vlc") {
+        "VLC"
+    } else if ua_lower.contains("nvidia") || ua_lower.contains("shield") {
+        "NVIDIA Shield"
+    } else if ua_lower.contains("synology") {
+        "Synology NAS"
+    } else if ua_lower.contains("qnap") {
+        "QNAP NAS"
+    } else if ua_lower.contains("fing") || ua_lower.contains("fingbox") {
+        "Fing Fingbox"
+    } else if ua_lower.contains("upnp") || ua_lower.contains("dlna") {
+        "UPnP/DLNA Client"
+    } else if st_lower.contains("dial-multiscreen") {
+        "DIAL Client"
+    } else if st_lower.contains("mediarenderer") {
+        "Media Renderer Client"
+    } else if st_lower.contains("mediaserver") {
+        "Media Server Client"
+    } else if st_lower == "ssdp:all" || st_lower == "upnp:rootdevice" {
+        "UPnP Scanner"
+    } else {
+        "Unknown"
+    }
+    .to_string();
+
+    // Extract name from USER-AGENT (first product/version token)
+    let name = user_agent.as_ref().map(|ua| {
+        ua.split_whitespace()
+            .next()
+            .unwrap_or("Unknown")
+            .to_string()
+    });
+
+    DeviceFingerprint { device_type, name }
+}
+
+fn decode_msearch_details(headers: &HashMap<String, String>) -> MSearchDetails {
+    let st = headers.get("ST").cloned().unwrap_or_else(|| "unknown".to_string());
+    let mx = headers.get("MX").and_then(|s| s.parse::<u32>().ok());
+    let man = headers.get("MAN").cloned().unwrap_or_default();
+
+    let st_description = decode_search_target(&st);
+
+    let discovery_type = if man.contains("ssdp:discover") {
+        "Standard SSDP Discovery"
+    } else {
+        "Custom Discovery"
+    }
+    .to_string();
+
+    MSearchDetails {
+        search_target: st,
+        search_target_description: st_description,
+        max_wait_seconds: mx,
+        discovery_type,
+    }
+}
+
+fn decode_search_target(st: &str) -> String {
+    let st_lower = st.to_lowercase();
+
+    if st_lower == "ssdp:all" {
+        "All UPnP devices and services".to_string()
+    } else if st_lower == "upnp:rootdevice" {
+        "All UPnP root devices".to_string()
+    } else if st_lower.starts_with("uuid:") {
+        format!("Specific device with UUID: {}", &st[5..])
+    } else if st_lower.starts_with("urn:schemas-upnp-org:device:") {
+        let device_type = st.split(':').nth(3).unwrap_or("unknown");
+        format!("UPnP device type: {}", device_type)
+    } else if st_lower.starts_with("urn:schemas-upnp-org:service:") {
+        let service_type = st.split(':').nth(3).unwrap_or("unknown");
+        format!("UPnP service type: {}", service_type)
+    } else if st_lower.contains("dial-multiscreen") {
+        "DIAL protocol (Chromecast/Smart TV casting)".to_string()
+    } else if st_lower.contains("mediarenderer") {
+        "DLNA Media Renderer".to_string()
+    } else if st_lower.contains("mediaserver") {
+        "DLNA Media Server".to_string()
+    } else if st_lower.contains("basicdevice") {
+        "UPnP Basic Device".to_string()
+    } else if st_lower.contains("internetgatewaydevice") {
+        "Internet Gateway Device (Router)".to_string()
+    } else if st_lower.contains("wanconnection") || st_lower.contains("wanipconnection") {
+        "WAN Connection Service".to_string()
+    } else if st_lower.starts_with("urn:") {
+        format!("Custom URN: {}", st)
+    } else {
+        format!("Custom search target: {}", st)
+    }
+}
+
 fn get_local_ip_auto() -> Option<Ipv4Addr> {
     // Try to find a non-loopback IPv4 address by checking default route
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -284,7 +418,15 @@ fn write_log_entry(writer: &Arc<Mutex<BufWriter<File>>>, entry: &SsdpLogEntry) {
 }
 
 fn print_packet(entry: &SsdpLogEntry) {
-    let marker = if entry.is_new_device { "NEW DEVICE" } else { "PACKET" };
+    let marker = if entry.is_new_device {
+        if entry.packet_type == "M-SEARCH" {
+            "NEW SCANNER"
+        } else {
+            "NEW DEVICE"
+        }
+    } else {
+        "PACKET"
+    };
     println!("[{}] {} from {}:{}", entry.timestamp_local, marker, entry.source_ip, entry.source_port);
     println!("  Type: {}", entry.packet_type);
     println!("  Status: {}", entry.status_line);
@@ -292,8 +434,22 @@ fn print_packet(entry: &SsdpLogEntry) {
     if let Some(fp) = &entry.fingerprint {
         println!("  Fingerprint: {}", fp.device_type);
         if let Some(name) = &fp.name {
-            println!("  Device Name: {}", name);
+            if entry.packet_type == "M-SEARCH" {
+                println!("  User-Agent: {}", name);
+            } else {
+                println!("  Device Name: {}", name);
+            }
         }
+    }
+
+    // Print M-SEARCH decoded details
+    if let Some(details) = &entry.msearch_details {
+        println!("  M-SEARCH Details:");
+        println!("    Search Target: {} ({})", details.search_target, details.search_target_description);
+        if let Some(mx) = details.max_wait_seconds {
+            println!("    Max Wait: {} seconds", mx);
+        }
+        println!("    Discovery Type: {}", details.discovery_type);
     }
 
     println!("  Headers:");
@@ -316,26 +472,37 @@ fn process_packet(
         return;
     };
 
-    // Skip M-SEARCH requests (we only care about responses/notifications)
-    if packet.packet_type == "M-SEARCH" {
-        return;
-    }
+    let is_msearch = packet.packet_type == "M-SEARCH";
 
-    let usn = packet.headers.get("USN").cloned().unwrap_or_default();
+    // For M-SEARCH, track by IP + USER-AGENT combination
+    // For other packets, track by USN
+    let tracking_key = if is_msearch {
+        let user_agent = packet.headers.get("USER-AGENT").cloned().unwrap_or_default();
+        format!("msearch:{}:{}", source_ip, user_agent)
+    } else {
+        packet.headers.get("USN").cloned().unwrap_or_default()
+    };
 
-    let is_new_device = if !usn.is_empty() {
+    let is_new_device = if !tracking_key.is_empty() {
         let mut seen = seen_usns.lock().unwrap();
-        if seen.contains(&usn) {
+        if seen.contains(&tracking_key) {
             false
         } else {
-            seen.insert(usn.clone());
+            seen.insert(tracking_key);
             true
         }
     } else {
         false
     };
 
-    let fingerprint = fingerprint_device(&packet.headers);
+    let (fingerprint, msearch_details) = if is_msearch {
+        let fp = fingerprint_msearch_sender(&packet.headers);
+        let details = decode_msearch_details(&packet.headers);
+        (fp, Some(details))
+    } else {
+        (fingerprint_device(&packet.headers), None)
+    };
+
     let now = Utc::now();
 
     let entry = SsdpLogEntry {
@@ -348,6 +515,7 @@ fn process_packet(
         headers: packet.headers,
         fingerprint: Some(fingerprint),
         is_new_device,
+        msearch_details,
     };
 
     write_log_entry(log_writer, &entry);
