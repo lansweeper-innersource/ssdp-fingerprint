@@ -9,11 +9,12 @@ use std::io::{self, BufWriter, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SSDP_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
 const MSEARCH_INTERVAL_SECS: u64 = 30;
+const BUFFER_WINDOW_SECS: u64 = 30;
 const LOG_FILE: &str = "ssdp-packets.jsonl";
 const API_LOG_FILE: &str = "ssdp-api-request.json";
 
@@ -113,7 +114,6 @@ struct SsdpLogEntry {
     status_line: String,
     headers: HashMap<String, String>,
     fingerprint: Option<DeviceFingerprint>,
-    is_new_device: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     msearch_details: Option<MSearchDetails>,
 }
@@ -143,10 +143,49 @@ struct ApiRequest {
     devices: Vec<ApiDevice>,
 }
 
+#[derive(Clone)]
 struct SsdpPacket {
     packet_type: String,
     status_line: String,
     headers: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+enum PacketClass {
+    DeviceAnnouncement,
+    ClientSearch,
+}
+
+#[allow(dead_code)]
+struct BufferedPacket {
+    packet: SsdpPacket,
+    class: PacketClass,
+    source_ip: String,
+    source_port: u16,
+    dedup_key: String,
+    fingerprint: DeviceFingerprint,
+    msearch_details: Option<MSearchDetails>,
+    received_at: Instant,
+}
+
+struct PacketBuffer {
+    packets: Vec<BufferedPacket>,
+    window_start: Instant,
+}
+
+fn classify_packet(packet: &SsdpPacket) -> Option<PacketClass> {
+    let man = packet.headers.get("MAN").map(|s| s.to_lowercase());
+    if let Some(ref man_val) = man {
+        if man_val.contains("ssdp:discover") {
+            return Some(PacketClass::ClientSearch);
+        }
+    }
+
+    if packet.headers.contains_key("USN") || packet.headers.contains_key("NTS") {
+        return Some(PacketClass::DeviceAnnouncement);
+    }
+
+    None
 }
 
 fn parse_ssdp_packet(data: &[u8]) -> Option<SsdpPacket> {
@@ -257,6 +296,33 @@ fn extract_device_name(usn: &Option<String>, server: &Option<String>) -> Option<
             .unwrap_or("Unknown")
             .to_string()
     })
+}
+
+fn extract_uuid_from_usn(usn: &str) -> Option<String> {
+    if let Some(start) = usn.find("uuid:") {
+        let rest = &usn[start + 5..];
+        if let Some(end) = rest.find("::") {
+            return Some(rest[..end].to_string());
+        }
+        return Some(rest.to_string());
+    }
+    None
+}
+
+fn compute_dedup_key(class: &PacketClass, packet: &SsdpPacket, source_ip: &str) -> String {
+    match class {
+        PacketClass::DeviceAnnouncement => {
+            packet
+                .headers
+                .get("USN")
+                .and_then(|usn| extract_uuid_from_usn(usn))
+                .unwrap_or_else(|| source_ip.to_string())
+        }
+        PacketClass::ClientSearch => {
+            let st = packet.headers.get("ST").cloned().unwrap_or_default();
+            format!("{}:{}", source_ip, st)
+        }
+    }
 }
 
 fn fingerprint_msearch_sender(headers: &HashMap<String, String>) -> DeviceFingerprint {
@@ -437,42 +503,79 @@ fn write_log_entry(writer: &Arc<Mutex<BufWriter<File>>>, entry: &SsdpLogEntry) {
     }
 }
 
-fn write_api_log(api_state: &Arc<Mutex<ApiRequest>>, entry: &SsdpLogEntry) {
-    let mut state = api_state.lock().unwrap();
+fn deduplicate(packets: Vec<BufferedPacket>) -> Vec<BufferedPacket> {
+    let mut seen = HashSet::new();
+    packets
+        .into_iter()
+        .filter(|p| seen.insert(p.dedup_key.clone()))
+        .collect()
+}
 
-    let ssdp_entry = ApiSsdpEntry {
-        packet_type: entry.packet_type.clone(),
-        headers: entry.headers.clone(),
-        msearch_details: entry.msearch_details.clone(),
-    };
+fn build_api_batch(packets: &[BufferedPacket]) -> ApiRequest {
+    let mut by_ip: HashMap<String, Vec<ApiSsdpEntry>> = HashMap::new();
 
-    if let Some(device) = state.devices.iter_mut().find(|d| d.ip == entry.source_ip) {
-        device.ssdp.push(ssdp_entry);
-    } else {
-        state.devices.push(ApiDevice {
-            ip: entry.source_ip.clone(),
-            ssdp: vec![ssdp_entry],
-        });
+    for p in packets {
+        let ssdp_entry = ApiSsdpEntry {
+            packet_type: p.packet.packet_type.clone(),
+            headers: p.packet.headers.clone(),
+            msearch_details: p.msearch_details.clone(),
+        };
+        by_ip
+            .entry(p.source_ip.clone())
+            .or_default()
+            .push(ssdp_entry);
     }
 
-    if let Ok(json) = serde_json::to_string_pretty(&*state) {
+    let devices = by_ip
+        .into_iter()
+        .map(|(ip, ssdp)| ApiDevice { ip, ssdp })
+        .collect();
+
+    ApiRequest { devices }
+}
+
+fn write_api_batch(request: &ApiRequest) {
+    if let Ok(json) = serde_json::to_string_pretty(request) {
         if let Ok(mut file) = File::create(API_LOG_FILE) {
             let _ = file.write_all(json.as_bytes());
         }
     }
 }
 
-fn print_packet(entry: &SsdpLogEntry) {
-    let marker = if entry.is_new_device {
-        if entry.packet_type == "M-SEARCH" {
-            "NEW SCANNER"
-        } else {
-            "NEW DEVICE"
-        }
-    } else {
-        "PACKET"
+fn flush_buffer(buffer: &Arc<Mutex<PacketBuffer>>) {
+    let packets = {
+        let mut buf = buffer.lock().unwrap();
+        let packets = std::mem::take(&mut buf.packets);
+        buf.window_start = Instant::now();
+        packets
     };
-    println!("[{}] {} from {}:{}", entry.timestamp_local, marker, entry.source_ip, entry.source_port);
+
+    if packets.is_empty() {
+        return;
+    }
+
+    let total = packets.len();
+    let deduped = deduplicate(packets);
+    let unique = deduped.len();
+    let batch = build_api_batch(&deduped);
+    write_api_batch(&batch);
+
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    println!(
+        "[{}] BATCH FLUSH: {} packets received, {} unique after dedup, {} sources",
+        timestamp, total, unique, batch.devices.len()
+    );
+}
+
+fn start_flush_timer(buffer: Arc<Mutex<PacketBuffer>>) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(BUFFER_WINDOW_SECS));
+        flush_buffer(&buffer);
+    });
+}
+
+fn print_packet(entry: &SsdpLogEntry) {
+    println!("[{}] PACKET from {}:{}", entry.timestamp_local, entry.source_ip, entry.source_port);
     println!("  Type: {}", entry.packet_type);
     println!("  Status: {}", entry.status_line);
 
@@ -506,73 +609,65 @@ fn print_packet(entry: &SsdpLogEntry) {
     println!();
 }
 
-fn process_packet(
+fn ingest_packet(
     data: &[u8],
     source_ip: String,
     source_port: u16,
-    seen_usns: &Arc<Mutex<HashSet<String>>>,
+    buffer: &Arc<Mutex<PacketBuffer>>,
     log_writer: &Arc<Mutex<BufWriter<File>>>,
-    api_state: &Arc<Mutex<ApiRequest>>,
 ) {
     let Some(packet) = parse_ssdp_packet(data) else {
         return;
     };
 
-    let is_msearch = packet.packet_type == "M-SEARCH";
-
-    // For M-SEARCH, track by IP + USER-AGENT combination
-    // For other packets, track by USN
-    let tracking_key = if is_msearch {
-        let user_agent = packet.headers.get("USER-AGENT").cloned().unwrap_or_default();
-        format!("msearch:{}:{}", source_ip, user_agent)
-    } else {
-        packet.headers.get("USN").cloned().unwrap_or_default()
+    let Some(class) = classify_packet(&packet) else {
+        return;
     };
 
-    let is_new_device = if !tracking_key.is_empty() {
-        let mut seen = seen_usns.lock().unwrap();
-        if seen.contains(&tracking_key) {
-            false
-        } else {
-            seen.insert(tracking_key);
-            true
+    let dedup_key = compute_dedup_key(&class, &packet, &source_ip);
+
+    let (fingerprint, msearch_details) = match class {
+        PacketClass::ClientSearch => {
+            let fp = fingerprint_msearch_sender(&packet.headers);
+            let details = decode_msearch_details(&packet.headers);
+            (fp, Some(details))
         }
-    } else {
-        false
-    };
-
-    let (fingerprint, msearch_details) = if is_msearch {
-        let fp = fingerprint_msearch_sender(&packet.headers);
-        let details = decode_msearch_details(&packet.headers);
-        (fp, Some(details))
-    } else {
-        (fingerprint_device(&packet.headers), None)
+        PacketClass::DeviceAnnouncement => (fingerprint_device(&packet.headers), None),
     };
 
     let now = Utc::now();
-
     let entry = SsdpLogEntry {
         timestamp: now,
         timestamp_local: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        source_ip,
+        source_ip: source_ip.clone(),
         source_port,
-        packet_type: packet.packet_type,
-        status_line: packet.status_line,
-        headers: packet.headers,
-        fingerprint: Some(fingerprint),
-        is_new_device,
-        msearch_details,
+        packet_type: packet.packet_type.clone(),
+        status_line: packet.status_line.clone(),
+        headers: packet.headers.clone(),
+        fingerprint: Some(fingerprint.clone()),
+        msearch_details: msearch_details.clone(),
     };
 
     write_log_entry(log_writer, &entry);
-    write_api_log(api_state, &entry);
     print_packet(&entry);
+
+    let buffered = BufferedPacket {
+        packet,
+        class,
+        source_ip,
+        source_port,
+        dedup_key,
+        fingerprint,
+        msearch_details,
+        received_at: Instant::now(),
+    };
+
+    buffer.lock().unwrap().packets.push(buffered);
 }
 
 fn start_msearch_listener(
-    seen_usns: Arc<Mutex<HashSet<String>>>,
+    buffer: Arc<Mutex<PacketBuffer>>,
     log_writer: Arc<Mutex<BufWriter<File>>>,
-    api_state: Arc<Mutex<ApiRequest>>,
     local_ip: Ipv4Addr,
 ) {
     thread::spawn(move || {
@@ -615,7 +710,7 @@ fn start_msearch_listener(
                     Ok((len, addr)) => {
                         let source_ip = addr.ip().to_string();
                         let source_port = addr.port();
-                        process_packet(&buf[..len], source_ip, source_port, &seen_usns, &log_writer, &api_state);
+                        ingest_packet(&buf[..len], source_ip, source_port, &buffer, &log_writer);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         break;
@@ -660,13 +755,18 @@ fn main() -> io::Result<()> {
     println!("Logging API requests to: {}\n", API_LOG_FILE);
 
     let log_writer = Arc::new(Mutex::new(open_log_file()?));
-    let api_state = Arc::new(Mutex::new(ApiRequest { devices: vec![] }));
-    let seen_usns: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let buffer = Arc::new(Mutex::new(PacketBuffer {
+        packets: Vec::new(),
+        window_start: Instant::now(),
+    }));
 
     let socket = create_multicast_socket(local_ip)?;
 
+    // Start flush timer for batched API output
+    start_flush_timer(Arc::clone(&buffer));
+
     // Start M-SEARCH sender/receiver thread for unicast responses
-    start_msearch_listener(Arc::clone(&seen_usns), Arc::clone(&log_writer), Arc::clone(&api_state), local_ip);
+    start_msearch_listener(Arc::clone(&buffer), Arc::clone(&log_writer), local_ip);
 
     let mut buf = [0u8; 4096];
 
@@ -678,7 +778,7 @@ fn main() -> io::Result<()> {
             Ok((len, addr)) => {
                 let source_ip = addr.ip().to_string();
                 let source_port = addr.port();
-                process_packet(&buf[..len], source_ip, source_port, &seen_usns, &log_writer, &api_state);
+                ingest_packet(&buf[..len], source_ip, source_port, &buffer, &log_writer);
             }
             Err(e) => {
                 eprintln!("Error receiving packet: {}", e);
