@@ -95,7 +95,7 @@ fn resolve_interface_ip(args: &Args) -> Option<Ipv4Addr> {
 }
 
 /// Decode M-SEARCH specific fields into human-readable format
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct MSearchDetails {
     search_target: String,
     search_target_description: String,
@@ -126,7 +126,10 @@ struct DeviceFingerprint {
 
 #[derive(Debug, Serialize)]
 struct ApiSsdpEntry {
+    packet_type: String,
     headers: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msearch_details: Option<MSearchDetails>,
 }
 
 #[derive(Debug, Serialize)]
@@ -438,7 +441,9 @@ fn write_api_log(api_state: &Arc<Mutex<ApiRequest>>, entry: &SsdpLogEntry) {
     let mut state = api_state.lock().unwrap();
 
     let ssdp_entry = ApiSsdpEntry {
+        packet_type: entry.packet_type.clone(),
         headers: entry.headers.clone(),
+        msearch_details: entry.msearch_details.clone(),
     };
 
     if let Some(device) = state.devices.iter_mut().find(|d| d.ip == entry.source_ip) {
