@@ -15,6 +15,7 @@ const SSDP_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
 const MSEARCH_INTERVAL_SECS: u64 = 30;
 const LOG_FILE: &str = "ssdp-packets.jsonl";
+const API_LOG_FILE: &str = "ssdp-api-request.json";
 
 #[derive(Parser, Debug)]
 #[command(name = "ssdp-fingerprint")]
@@ -121,6 +122,22 @@ struct SsdpLogEntry {
 struct DeviceFingerprint {
     device_type: String,
     name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiSsdpEntry {
+    headers: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiDevice {
+    ip: String,
+    ssdp: Vec<ApiSsdpEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiRequest {
+    devices: Vec<ApiDevice>,
 }
 
 struct SsdpPacket {
@@ -417,6 +434,29 @@ fn write_log_entry(writer: &Arc<Mutex<BufWriter<File>>>, entry: &SsdpLogEntry) {
     }
 }
 
+fn write_api_log(api_state: &Arc<Mutex<ApiRequest>>, entry: &SsdpLogEntry) {
+    let mut state = api_state.lock().unwrap();
+
+    let ssdp_entry = ApiSsdpEntry {
+        headers: entry.headers.clone(),
+    };
+
+    if let Some(device) = state.devices.iter_mut().find(|d| d.ip == entry.source_ip) {
+        device.ssdp.push(ssdp_entry);
+    } else {
+        state.devices.push(ApiDevice {
+            ip: entry.source_ip.clone(),
+            ssdp: vec![ssdp_entry],
+        });
+    }
+
+    if let Ok(json) = serde_json::to_string_pretty(&*state) {
+        if let Ok(mut file) = File::create(API_LOG_FILE) {
+            let _ = file.write_all(json.as_bytes());
+        }
+    }
+}
+
 fn print_packet(entry: &SsdpLogEntry) {
     let marker = if entry.is_new_device {
         if entry.packet_type == "M-SEARCH" {
@@ -467,6 +507,7 @@ fn process_packet(
     source_port: u16,
     seen_usns: &Arc<Mutex<HashSet<String>>>,
     log_writer: &Arc<Mutex<BufWriter<File>>>,
+    api_state: &Arc<Mutex<ApiRequest>>,
 ) {
     let Some(packet) = parse_ssdp_packet(data) else {
         return;
@@ -519,12 +560,14 @@ fn process_packet(
     };
 
     write_log_entry(log_writer, &entry);
+    write_api_log(api_state, &entry);
     print_packet(&entry);
 }
 
 fn start_msearch_listener(
     seen_usns: Arc<Mutex<HashSet<String>>>,
     log_writer: Arc<Mutex<BufWriter<File>>>,
+    api_state: Arc<Mutex<ApiRequest>>,
     local_ip: Ipv4Addr,
 ) {
     thread::spawn(move || {
@@ -567,7 +610,7 @@ fn start_msearch_listener(
                     Ok((len, addr)) => {
                         let source_ip = addr.ip().to_string();
                         let source_port = addr.port();
-                        process_packet(&buf[..len], source_ip, source_port, &seen_usns, &log_writer);
+                        process_packet(&buf[..len], source_ip, source_port, &seen_usns, &log_writer, &api_state);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         break;
@@ -608,15 +651,17 @@ fn main() -> io::Result<()> {
     }
     println!("Listening for SSDP announcements (multicast NOTIFY)");
     println!("Sending M-SEARCH every {} seconds (unicast responses)", MSEARCH_INTERVAL_SECS);
-    println!("Logging packets to: {}\n", LOG_FILE);
+    println!("Logging packets to: {}", LOG_FILE);
+    println!("Logging API requests to: {}\n", API_LOG_FILE);
 
     let log_writer = Arc::new(Mutex::new(open_log_file()?));
+    let api_state = Arc::new(Mutex::new(ApiRequest { devices: vec![] }));
     let seen_usns: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     let socket = create_multicast_socket(local_ip)?;
 
     // Start M-SEARCH sender/receiver thread for unicast responses
-    start_msearch_listener(Arc::clone(&seen_usns), Arc::clone(&log_writer), local_ip);
+    start_msearch_listener(Arc::clone(&seen_usns), Arc::clone(&log_writer), Arc::clone(&api_state), local_ip);
 
     let mut buf = [0u8; 4096];
 
@@ -628,7 +673,7 @@ fn main() -> io::Result<()> {
             Ok((len, addr)) => {
                 let source_ip = addr.ip().to_string();
                 let source_port = addr.port();
-                process_packet(&buf[..len], source_ip, source_port, &seen_usns, &log_writer);
+                process_packet(&buf[..len], source_ip, source_port, &seen_usns, &log_writer, &api_state);
             }
             Err(e) => {
                 eprintln!("Error receiving packet: {}", e);
